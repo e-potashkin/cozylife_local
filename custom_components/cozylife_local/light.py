@@ -34,6 +34,12 @@ from .coordinator import CozyLifeCoordinator
 
 _LOGGER = logging.getLogger(__name__)
 
+# dsh-nocct: set from the field test of 2026-10-16. The strip's colour
+# temperature channel (DPID 3) receives writes and lights nothing, while
+# hue and saturation (DPID 5, 6) light the strip. Until the hardware is
+# replaced, Home Assistant exposes the colour channel only.
+STRIP_HAS_NO_WHITE = True
+
 
 def _kelvin_range_for_pid(pid: str | None) -> tuple[int, int]:
     """Return the default Kelvin range for a light model."""
@@ -103,7 +109,10 @@ class CozyLifeLight(CoordinatorEntity[CozyLifeCoordinator], LightEntity):
 
         if HUE in coordinator.device.dpid and SAT in coordinator.device.dpid:
             self._supported_color_modes.add(ColorMode.HS)
-        if TEMP in coordinator.device.dpid:
+        # dsh-nocct: the white channel (DPID 3) of this strip is dead, so
+        # Home Assistant must not offer a colour-temperature control for it.
+        # The colour channel can still make white: hue 0, saturation 0.
+        if TEMP in coordinator.device.dpid and not STRIP_HAS_NO_WHITE:
             self._supported_color_modes.add(ColorMode.COLOR_TEMP)
         if BRIGHT in coordinator.device.dpid and not self._supported_color_modes:
             self._supported_color_modes.add(ColorMode.BRIGHTNESS)
@@ -138,35 +147,24 @@ class CozyLifeLight(CoordinatorEntity[CozyLifeCoordinator], LightEntity):
     @property
     def color_mode(self) -> Optional[ColorMode]:
         """Return the color mode of the light."""
-        # The original integration determines color mode based on which values are valid (< 60000)
-        # not just based on work_mode. This is critical for proper UI updates.
-
-        # Check if we have valid color values (< 60000)
-        if (HUE in self.coordinator.data and SAT in self.coordinator.data and
-            self.coordinator.data[HUE] < 60000):
+        # dsh-nocct: this strip has no working white channel, so the entity
+        # reports the colour channel only. The whole property is replaced
+        # because Home Assistant rejects an entity whose color_mode is not in
+        # supported_color_modes, and the original ends at COLOR_TEMP.
+        if HUE in self.coordinator.data and SAT in self.coordinator.data:
             return ColorMode.HS
-
-        # Check if we have valid color temp values (< 60000)
-        if TEMP in self.coordinator.data and self.coordinator.data[TEMP] < 60000:
-            return ColorMode.COLOR_TEMP
-
-        # Check if we have brightness control
-        if ColorMode.BRIGHTNESS in self._supported_color_modes and BRIGHT in self.coordinator.data:
-            return ColorMode.BRIGHTNESS
-
-        if ColorMode.COLOR_TEMP in self._supported_color_modes:
-            return ColorMode.COLOR_TEMP
         if ColorMode.HS in self._supported_color_modes:
             return ColorMode.HS
-        if ColorMode.BRIGHTNESS in self._supported_color_modes:
+        if ColorMode.BRIGHTNESS in self._supported_color_modes and BRIGHT in self.coordinator.data:
             return ColorMode.BRIGHTNESS
-
         return ColorMode.ONOFF
 
     @property
     def supported_color_modes(self) -> Optional[set[ColorMode]]:
         """Flag of supported color modes by the light."""
-        return self._supported_color_modes
+        # dsh-nocct: hand back a fresh frozenset. ColorMode(...) does not take
+        # a set, and a cached frozenset would keep serving COLOR_TEMP.
+        return frozenset(self._supported_color_modes)
 
     @property
     def hs_color(self) -> Optional[tuple[float, float]]:
@@ -179,8 +177,11 @@ class CozyLifeLight(CoordinatorEntity[CozyLifeCoordinator], LightEntity):
         # This matches the original integration's validation logic.
         color_value = self.coordinator.data[HUE]
         if color_value >= 60000:
-            _LOGGER.debug(f"[COZYLIFE] hs_color: Color value {color_value} >= 60000, ignoring (device in white mode)")
-            return None
+            # dsh-nocct: the device idles DPID 5 and 6 while its white channel
+            # is selected. That channel lights nothing, and the colour channel
+            # makes white at hue 0 saturation 0, so report that instead of
+            # None, which Home Assistant rejects while color_mode is hs.
+            return (0.0, 0.0)
 
         # Device sends Hue 0-360, Saturation 0-1000
         # Do RGB round-trip conversion for consistency (matches original integration)
@@ -195,7 +196,7 @@ class CozyLifeLight(CoordinatorEntity[CozyLifeCoordinator], LightEntity):
     @property
     def color_temp_kelvin(self) -> Optional[int]:
         """Return the color temperature in Kelvin."""
-        if TEMP not in self.coordinator.data:
+        if STRIP_HAS_NO_WHITE or TEMP not in self.coordinator.data:
             return None
 
         # Check if color temp value is valid (< 60000). Device sends 65535 when in color mode.
