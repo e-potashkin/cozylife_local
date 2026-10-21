@@ -4,7 +4,6 @@ on:
   push:
     tags:
       - "v*"
-  workflow_dispatch:
 
 permissions:
   contents: write
@@ -15,16 +14,84 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v4
+        with:
+          fetch-depth: 0
+
+      - name: Install test runner
+        run: python3 -m pip install --disable-pip-version-check pytest
+
+      - name: Validate release source
+        id: version
+        run: |
+          set -euo pipefail
+          tag="${GITHUB_REF_NAME}"
+          version="${tag#v}"
+          manifest_version="$(jq -r '.version' custom_components/cozylife_local/manifest.json)"
+          test "${tag}" != "${version}"
+          test "${manifest_version}" = "${version}"
+          echo "version=${version}" >> "${GITHUB_OUTPUT}"
+          if [[ "${version}" =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            echo "prerelease=true" >> "${GITHUB_OUTPUT}"
+            echo "release_kind=prerelease" >> "${GITHUB_OUTPUT}"
+          elif [[ "${version}" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            echo "prerelease=false" >> "${GITHUB_OUTPUT}"
+            echo "release_kind=stable release" >> "${GITHUB_OUTPUT}"
+          else
+            echo "Unsupported numeric release version: ${version}" >&2
+            exit 1
+          fi
+
+      - name: Run regression tests
+        run: python3 -m pytest -q
+
+      - name: Compile integration
+        run: python3 -m compileall -q custom_components/cozylife_local
 
       - name: Build HACS release ZIP
         run: |
-          zip -r cozylife_new.zip custom_components/cozylife_local \
+          zip -r cozylife_local.zip custom_components/cozylife_local \
             -x "*/__pycache__/*" \
             -x "*.pyc" \
             -x "*/.DS_Store"
 
+      - name: Generate release notes
+        env:
+          RELEASE_VERSION: ${{ steps.version.outputs.version }}
+          RELEASE_KIND: ${{ steps.version.outputs.release_kind }}
+        run: |
+          set -euo pipefail
+          previous_tag="$(git describe --tags --abbrev=0 "${GITHUB_SHA}^" 2>/dev/null || true)"
+          changes=""
+          if [ -n "${previous_tag}" ]; then
+            changes="$(
+              git log --format='%s' --no-merges "${previous_tag}..${GITHUB_SHA}" \
+                | sed \
+                    -e '/^Prepare [0-9][0-9.]* prerelease$/d' \
+                    -e '/^Generate useful release notes automatically$/d' \
+                    -e '/^Harden CI, releases, and catalog automation$/d' \
+                    -e '/^Disable duplicate Dependabot updates on fork$/d' \
+                    -e '/^Bump /d'
+            )"
+          fi
+          {
+            echo "## CozyLife Local ${RELEASE_VERSION}"
+            echo
+            echo "This ${RELEASE_KIND} includes the following changes."
+            echo
+            echo "### Highlights"
+            echo
+            if [ -n "${changes}" ]; then
+              printf '%s\n' "${changes}" | sed 's/^/- /'
+            else
+              echo "- No user-facing behavior changes."
+            fi
+          } > RELEASE_NOTES.md
+
       - name: Upload release asset
-        uses: softprops/action-gh-release@v2
+        uses: softprops/action-gh-release@efb35369e0ad2afab669f228072c1b0d510eae64 # v3.0.3
         with:
-          files: cozylife_new.zip
+          files: cozylife_local.zip
+          name: CozyLife Local ${{ steps.version.outputs.version }}
+          body_path: RELEASE_NOTES.md
+          prerelease: ${{ steps.version.outputs.prerelease }}

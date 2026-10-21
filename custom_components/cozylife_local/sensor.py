@@ -34,7 +34,6 @@ from .const import (
     PLUG_VOLTAGE,
 )
 from .coordinator import CozyLifeCoordinator
-from .discovery import get_model_info
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -46,14 +45,14 @@ async def async_setup_entry(
     """Set up CozyLife sensor platform."""
     coordinator: CozyLifeCoordinator = hass.data[DOMAIN][config_entry.entry_id]
 
-    if not coordinator.device.dpid:
+    if (
+        not coordinator.classification.is_local_transport
+        or not coordinator.device.dpid
+    ):
         return
 
     entities = [CozyLifeIPAddressSensor(coordinator)]
     dpids = set(coordinator.device.dpid)
-    model_info = get_model_info(coordinator.device.pid)
-    if model_info:
-        dpids.update(model_info.dpids)
 
     if coordinator.classification.is_environment_sensor:
         entities.extend(
@@ -152,12 +151,13 @@ def _device_info(coordinator: CozyLifeCoordinator) -> DeviceInfo:
 class CozyLifeIPAddressSensor(CoordinatorEntity[CozyLifeCoordinator], SensorEntity):
     """Diagnostic sensor exposing the device IP address."""
 
+    _attr_has_entity_name = True
     _attr_entity_category = EntityCategory.DIAGNOSTIC
     _attr_icon = "mdi:ip-network"
 
     def __init__(self, coordinator: CozyLifeCoordinator) -> None:
         super().__init__(coordinator)
-        self._attr_name = f"{coordinator.device.device_model_name} IP Address"
+        self._attr_name = "IP address"
         self._attr_unique_id = f"{coordinator.device.device_id}_ip_address"
 
     @property
@@ -180,6 +180,7 @@ class CozyLifeSensorBase(
 ):
     """Base class for CozyLife sensors."""
 
+    _attr_has_entity_name = True
     def __init__(self, coordinator: CozyLifeCoordinator, entry: ConfigEntry, sensor_type: str):
         super().__init__(coordinator)
         self._sensor_type = sensor_type
@@ -235,7 +236,7 @@ class CozyLifeTemperatureSensor(CozyLifeSensorBase):
 
     def __init__(self, coordinator: CozyLifeCoordinator, entry: ConfigEntry):
         super().__init__(coordinator, entry, "temperature")
-        self._attr_name = f"{coordinator.device.device_model_name} Temperature"
+        self._attr_name = "Temperature"
 
     def _native_value_from_data(self) -> Optional[float]:
         raw = (self.coordinator.data or {}).get(SENSOR_TEMPERATURE)
@@ -253,7 +254,7 @@ class CozyLifeHumiditySensor(CozyLifeSensorBase):
 
     def __init__(self, coordinator: CozyLifeCoordinator, entry: ConfigEntry):
         super().__init__(coordinator, entry, "humidity")
-        self._attr_name = f"{coordinator.device.device_model_name} Humidity"
+        self._attr_name = "Humidity"
 
     def _native_value_from_data(self) -> Optional[float]:
         raw = (self.coordinator.data or {}).get(SENSOR_HUMIDITY)
@@ -272,7 +273,7 @@ class CozyLifeBatterySensor(CozyLifeSensorBase):
 
     def __init__(self, coordinator: CozyLifeCoordinator, entry: ConfigEntry):
         super().__init__(coordinator, entry, "battery")
-        self._attr_name = f"{coordinator.device.device_model_name} Battery"
+        self._attr_name = "Battery"
 
     def _native_value_from_data(self) -> Optional[float]:
         raw = (self.coordinator.data or {}).get(SENSOR_BATTERY)
@@ -284,6 +285,8 @@ class CozyLifeBatterySensor(CozyLifeSensorBase):
 class CozyLifePlugSensor(CoordinatorEntity[CozyLifeCoordinator], SensorEntity):
     """Metering sensor for CozyLife smart plugs."""
 
+    _attr_has_entity_name = True
+
     def __init__(
         self,
         coordinator: CozyLifeCoordinator,
@@ -291,7 +294,7 @@ class CozyLifePlugSensor(CoordinatorEntity[CozyLifeCoordinator], SensorEntity):
     ) -> None:
         super().__init__(coordinator)
         self._description = description
-        self._attr_name = f"{coordinator.device.device_model_name} {description.name}"
+        self._attr_name = description.name
         self._attr_unique_id = f"{coordinator.device.device_id}_{description.key}"
         self._attr_device_class = description.device_class
         self._attr_state_class = description.state_class

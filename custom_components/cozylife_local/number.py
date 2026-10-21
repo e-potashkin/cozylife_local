@@ -9,7 +9,6 @@ from homeassistant.helpers.update_coordinator import CoordinatorEntity
 
 from .const import DOMAIN, LIGHT_COUNTDOWN, PLUG_COUNTDOWN
 from .coordinator import CozyLifeCoordinator
-from .discovery import get_model_info
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -24,9 +23,6 @@ async def async_setup_entry(
     """Set up CozyLife number platform."""
     coordinator: CozyLifeCoordinator = hass.data[DOMAIN][config_entry.entry_id]
     dpids = set(coordinator.device.dpid or [])
-    model_info = get_model_info(coordinator.device.pid)
-    if model_info:
-        dpids.update(model_info.dpids)
 
     if (
         PLUG_COUNTDOWN in dpids
@@ -51,6 +47,7 @@ class CozyLifeCountdownNumberBase(
 ):
     """Countdown/timer control for CozyLife devices."""
 
+    _attr_has_entity_name = True
     _attr_icon = "mdi:timer-outline"
     _attr_mode = NumberMode.BOX
     _attr_native_min_value = 0
@@ -72,7 +69,7 @@ class CozyLifeCountdownNumberBase(
         super().__init__(coordinator)
         self._countdown_dpid = dpid
         self._device_kind = device_kind
-        self._attr_name = f"{coordinator.device.device_model_name} Countdown"
+        self._attr_name = "Countdown"
         self._attr_unique_id = f"{coordinator.device.device_id}_{unique_suffix}"
 
     @property
