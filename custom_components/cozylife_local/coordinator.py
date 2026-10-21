@@ -322,7 +322,14 @@ class CozyLifeCoordinator(DataUpdateCoordinator[dict[str, Any]]):
 
     async def _async_get_environment_state(self) -> dict[str, Any]:
         """Request state with the APK's local device-status payload."""
-        state_data = await self.device.async_get_status()
+        # dsh-full-light-state: the LED strip answers ``attr:[1]`` with DPID 1
+        # alone, so the light entity had no brightness and no colour, and the
+        # card painted its default amber. ``attr:[0]`` asks for every DPID in
+        # one answer (measured 2026-10-21).
+        if self.classification.is_light:
+            state_data = await self.device.async_get_state(["0"])
+        else:
+            state_data = await self.device.async_get_status()
         if state_data is None:
             raise UpdateFailed(f"Failed to query state from device {self.device.ip_address}")
         return state_data
