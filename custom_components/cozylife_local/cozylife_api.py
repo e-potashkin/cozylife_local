@@ -286,7 +286,11 @@ class CozyLifeDevice:
             # The APK's local TCP writer sends the JSON bytes directly.  CRLF
             # delimits device-to-client frames only; adding it to client writes
             # changes the on-wire command from the app's native form.
-            encoded_message = json.dumps(message, separators=(",", ":")).encode("utf8")
+            # dsh-crlf 2026-11-02: the LED strip and the smart socket ignore a client
+            # frame that does not end with CRLF (measured: with CRLF the strip
+            # answers attr:[0] in about 1 s, without it never). Upstream 1.1.6
+            # dropped the terminator on writes; put it back.
+            encoded_message = json.dumps(message, separators=(",", ":")).encode("utf8") + b"\r\n"
             _RAW_LOGGER.debug("Sending CozyLife frame: %s", summarize_frame(encoded_message))
             writer.write(encoded_message)
             await writer.drain()
@@ -320,7 +324,11 @@ class CozyLifeDevice:
             if writer is None:
                 return False
             message = self._create_message(cmd, payload)
-            encoded_message = json.dumps(message, separators=(",", ":")).encode("utf8")
+            # dsh-crlf 2026-11-02: the LED strip and the smart socket ignore a client
+            # frame that does not end with CRLF (measured: with CRLF the strip
+            # answers attr:[0] in about 1 s, without it never). Upstream 1.1.6
+            # dropped the terminator on writes; put it back.
+            encoded_message = json.dumps(message, separators=(",", ":")).encode("utf8") + b"\r\n"
             _RAW_LOGGER.debug("Sending CozyLife frame: %s", summarize_frame(encoded_message))
             writer.write(encoded_message)
             await asyncio.wait_for(writer.drain(), timeout=self._timeout)
@@ -476,7 +484,11 @@ class CozyLifeDevice:
                 self._state_waiters.append(state_waiter)
 
             message = self._create_message(CMD_QUERY, {"attr": attributes})
-            encoded_message = json.dumps(message, separators=(",", ":")).encode("utf8")
+            # dsh-crlf 2026-11-02: the LED strip and the smart socket ignore a client
+            # frame that does not end with CRLF (measured: with CRLF the strip
+            # answers attr:[0] in about 1 s, without it never). Upstream 1.1.6
+            # dropped the terminator on writes; put it back.
+            encoded_message = json.dumps(message, separators=(",", ":")).encode("utf8") + b"\r\n"
             _RAW_LOGGER.debug("Sending CozyLife frame: %s", summarize_frame(encoded_message))
             writer.write(encoded_message)
             await asyncio.wait_for(writer.drain(), timeout=timeout)
