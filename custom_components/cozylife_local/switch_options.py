@@ -6,5 +6,5 @@ from .coordinator import CozyLifeCoordinator
 
 
 def supported_dpids(coordinator: CozyLifeCoordinator) -> set[str]:
-    """Return the DPIDs reported by this individual local device."""
+    """Return the verified local capability inventory for this device."""
     return set(coordinator.device.dpid or [])

@@ -23,11 +23,16 @@ _LOGGER = logging.getLogger(__name__)
 DATA_DISCOVERY_SERVICE = "background_udp_discovery"
 DATA_DISCOVERY_LOCK = "background_udp_discovery_lock"
 DATA_DISCOVERY_STOP_UNSUB = "background_udp_discovery_stop_unsub"
-# The APK broadcasts less often, but an environment sensor can be awake for a
-# short, variable window. Keep the shared discovery request present at the
-# same 500 ms cadence used by the known-address sensor probe.
-DISCOVERY_BROADCAST_INTERVAL_SECONDS = 0.5
-APK_NETWORK_CHANGE_BROADCAST_COUNT = 17
+# The APK's AppDeamon invokes UdpBoardcastChecker every 10 seconds. It opens a
+# short Wi-Fi UDP search window (nominally five seconds) and emits one command-0
+# discovery broadcast. This shared listener deliberately remains open for Home
+# Assistant's configured devices, but preserves the APK's broadcast cadence.
+# It is discovery lifecycle timing only; it is not a sensor wake schedule.
+DISCOVERY_BROADCAST_INTERVAL_SECONDS = 10.0
+APK_NETWORK_CHANGE_BROADCAST_COUNT = 1
+# WifiUdpServer.isLocalhostOnline() expires an announced device after 15 s.
+# Keep the same presence boundary before issuing a powered-device health read.
+APK_LOCAL_PRESENCE_CACHE_SECONDS = 15.0
 
 
 @dataclass(frozen=True)
@@ -83,14 +88,39 @@ class CozyLifeBackgroundDiscovery:
         self._transport: asyncio.DatagramTransport | None = None
         self._broadcast_task: asyncio.Task[None] | None = None
         self._devices: dict[str, tuple[UdpDiscoveredDevice, float]] = {}
-        self._entry_callbacks: dict[str, Callable[[str], Awaitable[None]]] = {}
+        # Each callback is owned by a config entry.  Keeping that ownership is
+        # important when a user removes and immediately re-adds the same
+        # device: completion of the old entry's unload must not unregister the
+        # callback just installed by the new entry.
+        self._entry_callbacks: dict[
+            str, tuple[str, Callable[[str], Awaitable[None]]]
+        ] = {}
         self._address_callbacks: dict[str, Callable[[str], Awaitable[None]]] = {}
+        # UDP replies arrive repeatedly.  One native discovery card per DID is
+        # sufficient until it is either configured (which clears this set in
+        # register_device) or Home Assistant restarts.
+        self._pending_discovery_ids: set[str] = set()
 
     async def async_start(self) -> None:
         """Open the APK-style receive socket and begin its Wi-Fi cadence."""
-        if self._transport is not None:
+        if self._broadcast_task is not None:
             return
 
+        await self._async_open_receive_socket()
+        self._broadcast_task = self.hass.async_create_background_task(
+            self._async_broadcast_loop(),
+            "cozylife UDP discovery broadcaster",
+        )
+        _LOGGER.info(
+            "CozyLife UDP discovery opened its APK-style receive socket; sent %s "
+            "startup discovery request",
+            APK_NETWORK_CHANGE_BROADCAST_COUNT,
+        )
+
+    async def _async_open_receive_socket(self) -> None:
+        """Open the APK-style ephemeral UDP socket and retain its receive loop."""
+        if self._transport is not None:
+            return
         loop = asyncio.get_running_loop()
         transport, _protocol = await loop.create_datagram_endpoint(
             lambda: _ApkUdpDiscoveryProtocol(self._handle_device),
@@ -98,20 +128,13 @@ class CozyLifeBackgroundDiscovery:
             allow_broadcast=True,
         )
         self._transport = transport
-
-        # The APK emits this burst when its active network becomes Wi-Fi. Home
-        # Assistant startup is the corresponding point at which this service
-        # first has an active local network.
         self._send_broadcasts(APK_NETWORK_CHANGE_BROADCAST_COUNT)
-        self._broadcast_task = self.hass.async_create_background_task(
-            self._async_broadcast_loop(),
-            "cozylife UDP discovery broadcaster",
-        )
-        _LOGGER.info(
-            "CozyLife UDP discovery is listening on one shared socket; sent %s "
-            "APK network-start broadcasts",
-            APK_NETWORK_CHANGE_BROADCAST_COUNT,
-        )
+
+    def _close_receive_socket(self) -> None:
+        """Close the shared ephemeral discovery socket when the service stops."""
+        if self._transport is not None:
+            self._transport.close()
+            self._transport = None
 
     async def async_stop(self) -> None:
         """Stop the shared socket when Home Assistant stops."""
@@ -122,26 +145,52 @@ class CozyLifeBackgroundDiscovery:
             except asyncio.CancelledError:
                 pass
             self._broadcast_task = None
-        if self._transport is not None:
-            self._transport.close()
-            self._transport = None
+        self._close_receive_socket()
 
     @property
     def is_running(self) -> bool:
-        """Return whether the shared receive socket is currently open."""
-        return self._transport is not None
+        """Return whether the shared APK-style discovery lifecycle is active."""
+        return self._broadcast_task is not None or self._transport is not None
 
     def register_device(
         self,
         device_id: str,
+        entry_id: str,
         callback: Callable[[str], Awaitable[None]],
     ) -> None:
         """Route later APK UDP replies for one configured DID to its entry."""
-        self._entry_callbacks[device_id] = callback
+        self._pending_discovery_ids.discard(device_id)
+        self._entry_callbacks[device_id] = (entry_id, callback)
+        cached = getattr(self, "_devices", {}).get(device_id)
+        if cached is not None:
+            self.hass.async_create_task(callback(cached[0].ip_address))
 
-    def unregister_device(self, device_id: str) -> None:
-        """Stop routing replies to an unloaded config entry."""
-        self._entry_callbacks.pop(device_id, None)
+    def is_device_present(self, device_id: str | None, ip_address: str) -> bool:
+        """Return whether an APK-style UDP announcement is still fresh.
+
+        The Android app only queues a local Wi-Fi TCP message while its
+        WifiUdpServer cache contains the device.  That cache expires entries
+        15 seconds after their most recent UDP announcement.
+        """
+        if not device_id:
+            return False
+        cached = self._devices.get(device_id)
+        if cached is None:
+            return False
+        device, received_at = cached
+        if (
+            device.ip_address != ip_address
+            or time.monotonic() - received_at > APK_LOCAL_PRESENCE_CACHE_SECONDS
+        ):
+            self._devices.pop(device_id, None)
+            return False
+        return True
+
+    def unregister_device(self, device_id: str, entry_id: str) -> None:
+        """Stop routing replies only when this entry owns the registration."""
+        registered = self._entry_callbacks.get(device_id)
+        if registered is not None and registered[0] == entry_id:
+            self._entry_callbacks.pop(device_id, None)
 
     def register_address(
         self,
@@ -156,7 +205,7 @@ class CozyLifeBackgroundDiscovery:
         self._address_callbacks.pop(ip_address, None)
 
     async def _async_broadcast_loop(self) -> None:
-        """Keep one shared UDP discovery request present for sensor wake windows."""
+        """Repeat the APK daemon's command-0 broadcast every ten seconds."""
         while True:
             await asyncio.sleep(DISCOVERY_BROADCAST_INTERVAL_SECONDS)
             self._send_broadcasts(1)
@@ -176,32 +225,34 @@ class CozyLifeBackgroundDiscovery:
     def _handle_device(self, device: UdpDiscoveredDevice) -> None:
         """Cache an APK reply, refresh known entries, or start one discovery flow."""
         self._devices[device.device_id] = (device, time.monotonic())
-        callback = self._entry_callbacks.get(device.device_id)
+        registration = self._entry_callbacks.get(device.device_id)
+        callback = registration[1] if registration is not None else None
         route = "device ID"
         if callback is None:
             callback = self._address_callbacks.get(device.ip_address)
             route = "provisional address"
         if callback is not None:
             _LOGGER.debug(
-                "Routing CozyLife UDP announcement for DID %s at %s by %s",
-                device.device_id,
-                device.ip_address,
+                "Routing CozyLife UDP announcement by %s",
                 route,
             )
             self.hass.async_create_task(callback(device.ip_address))
             return
 
         if self._is_configured(device.device_id, device.ip_address):
+            self._pending_discovery_ids.discard(device.device_id)
             _LOGGER.debug(
-                "Ignoring CozyLife UDP announcement for already configured DID %s at %s",
-                device.device_id,
-                device.ip_address,
+                "Ignoring CozyLife UDP announcement for an already configured device",
             )
             return
+        if device.device_id in self._pending_discovery_ids:
+            _LOGGER.debug(
+                "Ignoring repeated CozyLife discovery announcement for a pending device",
+            )
+            return
+        self._pending_discovery_ids.add(device.device_id)
         _LOGGER.debug(
-            "Creating CozyLife discovery flow for DID %s at %s",
-            device.device_id,
-            device.ip_address,
+            "Creating CozyLife discovery flow",
         )
         self._async_start_discovery_flow(device)
 
@@ -234,8 +285,7 @@ class CozyLifeBackgroundDiscovery:
             )
         except Exception:  # pragma: no cover - Home Assistant owns flow errors.
             _LOGGER.exception(
-                "Unable to start a discovery flow for CozyLife device %s",
-                device.device_id,
+                "Unable to start a CozyLife discovery flow",
             )
 
 

@@ -58,7 +58,7 @@ async def async_setup_entry(
     coordinator: CozyLifeCoordinator = hass.data[DOMAIN][config_entry.entry_id]
 
     if coordinator.device.dpid is None or coordinator.device.device_model_name is None:
-        _LOGGER.error(f"Missing device DPID or model name for {coordinator.device.ip_address}. Cannot set up light.")
+        _LOGGER.error("Missing device DPID or model name. Cannot set up light.")
         return
 
     if not coordinator.classification.is_light:
@@ -149,15 +149,34 @@ class CozyLifeLight(CoordinatorEntity[CozyLifeCoordinator], LightEntity):
     @property
     def color_mode(self) -> Optional[ColorMode]:
         """Return the color mode of the light."""
-        # dsh-nocct: this strip has no working white channel, so the entity
-        # reports the colour channel only. The whole property is replaced
-        # because Home Assistant rejects an entity whose color_mode is not in
-        # supported_color_modes, and the original ends at COLOR_TEMP.
-        if HUE in self.coordinator.data and SAT in self.coordinator.data:
+        # Upstream 1.1.4: the mode follows the live values, not work_mode. A
+        # value of 65535 means "this channel is idle", so the UI tracks the
+        # device instead of the last command.
+        if (
+            HUE in self.coordinator.data
+            and SAT in self.coordinator.data
+            and self.coordinator.data[HUE] < 60000
+        ):
             return ColorMode.HS
+
+        # dsh-nocct: the strip's white channel (DPID 3) is dead. It stores a
+        # colour temperature and lights nothing, so this entity never reports
+        # COLOR_TEMP; the colour channel makes white as hue 0, saturation 0.
+        if (
+            not STRIP_HAS_NO_WHITE
+            and TEMP in self.coordinator.data
+            and self.coordinator.data[TEMP] < 60000
+        ):
+            return ColorMode.COLOR_TEMP
+
+        if (
+            ColorMode.BRIGHTNESS in self._supported_color_modes
+            and BRIGHT in self.coordinator.data
+        ):
+            return ColorMode.BRIGHTNESS
         if ColorMode.HS in self._supported_color_modes:
             return ColorMode.HS
-        if ColorMode.BRIGHTNESS in self._supported_color_modes and BRIGHT in self.coordinator.data:
+        if ColorMode.BRIGHTNESS in self._supported_color_modes:
             return ColorMode.BRIGHTNESS
         return ColorMode.ONOFF
 

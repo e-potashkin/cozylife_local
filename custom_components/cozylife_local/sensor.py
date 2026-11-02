@@ -9,14 +9,15 @@ from homeassistant.components.sensor import (
 from homeassistant.config_entries import ConfigEntry
 from homeassistant.const import (
     PERCENTAGE,
-    EntityCategory,
     STATE_UNAVAILABLE,
     STATE_UNKNOWN,
+    EntityCategory,
     UnitOfElectricCurrent,
     UnitOfElectricPotential,
     UnitOfEnergy,
     UnitOfPower,
     UnitOfTemperature,
+    UnitOfTime,
 )
 from homeassistant.core import HomeAssistant, callback
 from homeassistant.helpers.entity import DeviceInfo
@@ -25,13 +26,14 @@ from homeassistant.helpers.update_coordinator import CoordinatorEntity
 
 from .const import (
     DOMAIN,
-    SENSOR_TEMPERATURE,
-    SENSOR_HUMIDITY,
-    SENSOR_BATTERY,
-    PLUG_ENERGY,
+    PLUG_ADDED_ENERGY,
     PLUG_CURRENT,
+    PLUG_ENERGY,
     PLUG_POWER,
     PLUG_VOLTAGE,
+    SENSOR_BATTERY,
+    SENSOR_HUMIDITY,
+    SENSOR_TEMPERATURE,
 )
 from .coordinator import CozyLifeCoordinator
 
@@ -54,25 +56,45 @@ async def async_setup_entry(
     entities = [CozyLifeIPAddressSensor(coordinator)]
     dpids = set(coordinator.device.dpid)
 
-    if coordinator.classification.is_environment_sensor:
-        entities.extend(
-            [
-                CozyLifeTemperatureSensor(coordinator, config_entry),
-                CozyLifeHumiditySensor(coordinator, config_entry),
-                CozyLifeBatterySensor(coordinator, config_entry),
-            ]
-        )
+    if coordinator.classification.is_environment_sensor or coordinator.classification.is_multi_sensor:
+        entities.extend([
+            CozyLifeTemperatureSensor(coordinator, config_entry),
+            CozyLifeHumiditySensor(coordinator, config_entry),
+        ])
+        if SENSOR_BATTERY in dpids:
+            entities.append(CozyLifeBatterySensor(coordinator, config_entry))
 
     if coordinator.classification.supports_plug_metering:
         plug_sensor_descriptions = [
-            PlugSensorDescription(
-                dpid=PLUG_ENERGY,
-                key="energy",
-                name="Energy",
-                device_class=SensorDeviceClass.ENERGY,
-                state_class=SensorStateClass.TOTAL_INCREASING,
-                native_unit_of_measurement=UnitOfEnergy.KILO_WATT_HOUR,
-                scale=1000,
+            *(
+                [
+                    PlugSensorDescription(
+                        dpid=PLUG_ADDED_ENERGY,
+                        key="energy",
+                        name="Energy",
+                        device_class=SensorDeviceClass.ENERGY,
+                        state_class=SensorStateClass.TOTAL_INCREASING,
+                        native_unit_of_measurement=UnitOfEnergy.KILO_WATT_HOUR,
+                        scale=1000,
+                    )
+                ]
+                if PLUG_ADDED_ENERGY in dpids
+                else []
+            ),
+            *(
+                [
+                    PlugSensorDescription(
+                        dpid=PLUG_ENERGY,
+                        key="total_energy",
+                        name="Total energy",
+                        device_class=SensorDeviceClass.ENERGY,
+                        state_class=SensorStateClass.TOTAL_INCREASING,
+                        native_unit_of_measurement=UnitOfEnergy.KILO_WATT_HOUR,
+                        scale=1000,
+                    )
+                ]
+                if PLUG_ENERGY in dpids
+                else []
             ),
             PlugSensorDescription(
                 dpid=PLUG_CURRENT,
@@ -105,6 +127,120 @@ async def async_setup_entry(
             if description.dpid in dpids
         )
 
+    if coordinator.classification.is_energy_storage:
+        energy_sensor_descriptions = [
+            PlugSensorDescription(
+                dpid="2",
+                key="battery_status",
+                name="Battery status",
+                device_class=None,
+                state_class=None,
+                native_unit_of_measurement=None,
+                entity_category=EntityCategory.DIAGNOSTIC,
+            ),
+            PlugSensorDescription(
+                dpid="3",
+                key="battery_level",
+                name="Battery",
+                device_class=SensorDeviceClass.BATTERY,
+                state_class=SensorStateClass.MEASUREMENT,
+                native_unit_of_measurement=PERCENTAGE,
+            ),
+            PlugSensorDescription(
+                dpid="4",
+                key="total_output_power",
+                name="Total output power",
+                device_class=SensorDeviceClass.POWER,
+                state_class=SensorStateClass.MEASUREMENT,
+                native_unit_of_measurement=UnitOfPower.WATT,
+            ),
+            *[
+                PlugSensorDescription(
+                    dpid=str(dpid),
+                    key=f"output_{dpid - 4}_power",
+                    name=f"Output {dpid - 4} power",
+                    device_class=SensorDeviceClass.POWER,
+                    state_class=SensorStateClass.MEASUREMENT,
+                    native_unit_of_measurement=UnitOfPower.WATT,
+                )
+                for dpid in range(5, 21)
+            ],
+            PlugSensorDescription(
+                dpid="21",
+                key="total_input_power",
+                name="Total input power",
+                device_class=SensorDeviceClass.POWER,
+                state_class=SensorStateClass.MEASUREMENT,
+                native_unit_of_measurement=UnitOfPower.WATT,
+            ),
+            *[
+                PlugSensorDescription(
+                    dpid=str(dpid),
+                    key=f"input_{dpid - 21}_power",
+                    name=f"Input {dpid - 21} power",
+                    device_class=SensorDeviceClass.POWER,
+                    state_class=SensorStateClass.MEASUREMENT,
+                    native_unit_of_measurement=UnitOfPower.WATT,
+                )
+                for dpid in range(22, 30)
+            ],
+            PlugSensorDescription(
+                dpid="30",
+                key="remaining_usable_time",
+                name="Remaining usable time",
+                device_class=SensorDeviceClass.DURATION,
+                state_class=SensorStateClass.MEASUREMENT,
+                native_unit_of_measurement=UnitOfTime.MINUTES,
+            ),
+            PlugSensorDescription(
+                dpid="31",
+                key="remaining_charging_time",
+                name="Remaining charging time",
+                device_class=SensorDeviceClass.DURATION,
+                state_class=SensorStateClass.MEASUREMENT,
+                native_unit_of_measurement=UnitOfTime.MINUTES,
+            ),
+            PlugSensorDescription(
+                dpid="32",
+                key="battery_temperature",
+                name="Battery temperature",
+                device_class=SensorDeviceClass.TEMPERATURE,
+                state_class=SensorStateClass.MEASUREMENT,
+                native_unit_of_measurement=UnitOfTemperature.CELSIUS,
+                offset=-273,
+            ),
+            PlugSensorDescription(
+                dpid="44",
+                key="fault_code",
+                name="Fault code",
+                device_class=None,
+                state_class=None,
+                native_unit_of_measurement=None,
+                entity_category=EntityCategory.DIAGNOSTIC,
+            ),
+        ]
+        entities.extend(
+            CozyLifePlugSensor(coordinator, description)
+            for description in energy_sensor_descriptions
+            if description.dpid in dpids
+        )
+
+    if coordinator.classification.is_video_intercom and "102" in dpids:
+        entities.append(
+            CozyLifePlugSensor(
+                coordinator,
+                PlugSensorDescription(
+                    dpid="102",
+                    key="video_battery",
+                    name="Battery",
+                    device_class=SensorDeviceClass.BATTERY,
+                    state_class=SensorStateClass.MEASUREMENT,
+                    native_unit_of_measurement=PERCENTAGE,
+                    scale=10,
+                ),
+            )
+        )
+
     if not entities:
         _LOGGER.debug(
             f"Device {coordinator.device.ip_address} has no supported sensor DPIDs, skipping sensor platform setup."
@@ -126,6 +262,7 @@ class PlugSensorDescription:
         state_class: SensorStateClass | None,
         native_unit_of_measurement: str | None,
         scale: int = 1,
+        offset: float = 0,
         entity_category: EntityCategory | None = None,
     ) -> None:
         self.dpid = dpid
@@ -135,6 +272,7 @@ class PlugSensorDescription:
         self.state_class = state_class
         self.native_unit_of_measurement = native_unit_of_measurement
         self.scale = scale
+        self.offset = offset
         self.entity_category = entity_category
 
 
@@ -193,7 +331,10 @@ class CozyLifeSensorBase(
 
     @callback
     def _handle_coordinator_update(self) -> None:
-        if (value := self._native_value_from_data()) is not None:
+        if (
+            (value := self._native_value_from_data()) is not None
+            and self._is_valid_native_value(value)
+        ):
             self._last_valid_native_value = value
         self.async_write_ha_state()
 
@@ -209,9 +350,15 @@ class CozyLifeSensorBase(
             return
 
         try:
-            self._last_valid_native_value = float(last_state.state)
+            restored_value = float(last_state.state)
         except (TypeError, ValueError):
             return
+        if self._is_valid_native_value(restored_value):
+            self._last_valid_native_value = restored_value
+
+    def _is_valid_native_value(self, value: float) -> bool:
+        """Return whether a restored value is safe to present as a sensor state."""
+        return True
 
     def _native_value_from_data(self) -> Optional[float]:
         """Return the current native value from coordinator data."""
@@ -220,7 +367,7 @@ class CozyLifeSensorBase(
     @property
     def native_value(self) -> Optional[float]:
         value = self._native_value_from_data()
-        if value is not None:
+        if value is not None and self._is_valid_native_value(value):
             self._last_valid_native_value = value
             return value
 
@@ -233,6 +380,10 @@ class CozyLifeTemperatureSensor(CozyLifeSensorBase):
     _attr_device_class = SensorDeviceClass.TEMPERATURE
     _attr_state_class = SensorStateClass.MEASUREMENT
     _attr_native_unit_of_measurement = UnitOfTemperature.CELSIUS
+    # A sleeping sensor can deliver a real report whose rounded value is the
+    # same as the preceding one. Keep it observable in HA history instead of
+    # treating it as if no report arrived.
+    _attr_force_update = True
 
     def __init__(self, coordinator: CozyLifeCoordinator, entry: ConfigEntry):
         super().__init__(coordinator, entry, "temperature")
@@ -244,6 +395,10 @@ class CozyLifeTemperatureSensor(CozyLifeSensorBase):
             return None
         return round(raw / 10, 1)
 
+    def _is_valid_native_value(self, value: float) -> bool:
+        """Reject non-measurement values from malformed local sensor frames."""
+        return -40.0 <= value <= 80.0
+
 
 class CozyLifeHumiditySensor(CozyLifeSensorBase):
     """Humidity sensor entity."""
@@ -251,6 +406,9 @@ class CozyLifeHumiditySensor(CozyLifeSensorBase):
     _attr_device_class = SensorDeviceClass.HUMIDITY
     _attr_state_class = SensorStateClass.MEASUREMENT
     _attr_native_unit_of_measurement = PERCENTAGE
+    # See CozyLifeTemperatureSensor: unchanged reported measurements are still
+    # real sensor reports and should update their report timestamp.
+    _attr_force_update = True
 
     def __init__(self, coordinator: CozyLifeCoordinator, entry: ConfigEntry):
         super().__init__(coordinator, entry, "humidity")
@@ -261,6 +419,10 @@ class CozyLifeHumiditySensor(CozyLifeSensorBase):
         if raw is None:
             return None
         return float(raw)
+
+    def _is_valid_native_value(self, value: float) -> bool:
+        """Reject non-measurement values from malformed local sensor frames."""
+        return 0.0 <= value <= 100.0
 
 
 class CozyLifeBatterySensor(CozyLifeSensorBase):
@@ -311,7 +473,7 @@ class CozyLifePlugSensor(CoordinatorEntity[CozyLifeCoordinator], SensorEntity):
         if raw is None:
             return None
 
-        value = raw / self._description.scale
+        value = raw / self._description.scale + self._description.offset
         if self._description.scale == 1:
             return float(value)
         return round(value, 3)

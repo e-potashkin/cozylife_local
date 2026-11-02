@@ -16,6 +16,62 @@ from .cozylife_api import CozyLifeDevice
 from .discovery import async_load_model_catalog
 
 _LOGGER = logging.getLogger(__name__)
+_DEBUG_ENTRY_IDS = "debug_entry_ids"
+_OBSOLETE_SCHEDULE_UNIQUE_ID_SUFFIXES = frozenset(
+    {
+        "schedule_enabled",
+        "light_schedule_enabled",
+        "schedule_action",
+        "light_schedule_action",
+        "schedule_repeat",
+        "light_schedule_repeat",
+        "schedule_time",
+        "light_schedule_time",
+    }
+)
+
+
+def _refresh_debug_logging(hass: HomeAssistant) -> None:
+    """Keep package debug logging enabled while any entry requests it."""
+    enabled_entry_ids = hass.data[DOMAIN].get(_DEBUG_ENTRY_IDS, set())
+    logging.getLogger(__package__).setLevel(
+        logging.DEBUG if enabled_entry_ids else logging.NOTSET
+    )
+
+
+def _remove_debug_entry(hass: HomeAssistant, entry_id: str) -> None:
+    """Drop one entry's debug opt-in and update the package logger."""
+    debug_entry_ids = hass.data.get(DOMAIN, {}).get(_DEBUG_ENTRY_IDS)
+    if isinstance(debug_entry_ids, set):
+        debug_entry_ids.discard(entry_id)
+    _refresh_debug_logging(hass)
+
+
+@callback
+def _async_remove_obsolete_schedule_entities(
+    hass: HomeAssistant, entry: ConfigEntry
+) -> None:
+    """Remove the retired integration-owned scheduler entities on upgrade.
+
+    These entities represented Home Assistant-side schedules and must disappear
+    without writing DPID 3 or otherwise changing timers configured in the
+    CozyLife app.
+    """
+    # Keep this import local so lightweight setup tests do not need to load the
+    # full entity-registry implementation.
+    from homeassistant.helpers import entity_registry as er
+
+    registry = er.async_get(hass)
+    for entity_id, registry_entry in list(registry.entities.items()):
+        if (
+            registry_entry.config_entry_id == entry.entry_id
+            and registry_entry.platform == DOMAIN
+            and any(
+                registry_entry.unique_id.endswith(f"_{suffix}")
+                for suffix in _OBSOLETE_SCHEDULE_UNIQUE_ID_SUFFIXES
+            )
+        ):
+            registry.async_remove(entity_id)
 
 
 async def _async_ensure_discovery_controller(hass: HomeAssistant) -> None:
@@ -83,14 +139,17 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     # Home Assistant calls async_setup before config entries, but retain this
     # harmless guard for direct setup/reload paths and isolated test harnesses.
     hass.data.setdefault(DOMAIN, {})
-
-    # Check for debug logging option
-    pkg_logger = logging.getLogger(__package__)
+    # Debug logging is package-wide. Track every opted-in entry so setting up
+    # a second, non-debug device cannot silently disable diagnostics for the
+    # first one.
+    debug_entry_ids = hass.data[DOMAIN].setdefault(_DEBUG_ENTRY_IDS, set())
     if entry.options.get("enable_debug", False):
-        pkg_logger.setLevel(logging.DEBUG)
-        _LOGGER.debug(f"Debug logging enabled via options for {entry.title}")
+        debug_entry_ids.add(entry.entry_id)
     else:
-        pkg_logger.setLevel(logging.NOTSET)
+        debug_entry_ids.discard(entry.entry_id)
+    _refresh_debug_logging(hass)
+    if entry.options.get("enable_debug", False):
+        _LOGGER.debug("Debug logging enabled via options for %s", entry.title)
 
     discovery = hass.data[DOMAIN].get(DATA_DISCOVERY_SERVICE)
     if discovery is None or not discovery.is_running:
@@ -106,11 +165,28 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     if entry.data.get("entry_type") == DISCOVERY_CONTROLLER_ENTRY_TYPE:
         return True
 
-    await async_load_model_catalog(hass)
-    ip_address = entry.data["ip_address"]
+    device = None
+    try:
+        await async_load_model_catalog(hass)
+        device = CozyLifeDevice(entry.data["ip_address"])
+        return await _async_setup_device_entry(hass, entry, device, discovery)
+    except BaseException:
+        coordinator = hass.data[DOMAIN].pop(entry.entry_id, None)
+        if discovery is not None and device is not None:
+            if device.device_id:
+                discovery.unregister_device(device.device_id, entry.entry_id)
+            discovery.unregister_address(entry.data.get("ip_address", ""))
+        if coordinator is not None:
+            await coordinator.async_close()
+        elif device is not None:
+            await device.async_close()
+        _remove_debug_entry(hass, entry.entry_id)
+        raise
 
-    # Create a CozyLifeDevice instance for this entry
-    device = CozyLifeDevice(ip_address)
+
+async def _async_setup_device_entry(hass, entry, device, discovery) -> bool:
+    """Set up device resources under the caller's failure-cleanup boundary."""
+    ip_address = entry.data["ip_address"]
 
     # Restore only facts previously obtained for this config entry. This lets a
     # sleeping device start without a synchronous reply, without turning the
@@ -127,11 +203,13 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
             cached_dtp,
             [str(dpid) for dpid in cached_dpids],
         )
-        _LOGGER.debug(f"Restored device info for {ip_address} from cache.")
+        _LOGGER.debug("Restored device info from cache.")
     else:
         # No cache — must contact device (first-time setup)
         if not await device.async_update_device_info():
-            _LOGGER.error(f"Failed to get full device information for {ip_address}")
+            _LOGGER.error("Failed to get full device information")
+            await device.async_close()
+            _remove_debug_entry(hass, entry.entry_id)
             return False
         # Save discovered info into config entry for future restarts
         hass.config_entries.async_update_entry(entry, data={
@@ -144,9 +222,11 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
 
     # Create a coordinator for this device
     coordinator = CozyLifeCoordinator(hass, device, entry)
+    hass.data[DOMAIN][entry.entry_id] = coordinator
     if discovery is not None and device.device_id:
         discovery.register_device(
             device.device_id,
+            entry.entry_id,
             coordinator.async_handle_discovered_address,
         )
         if coordinator.is_sensor and device.device_id.startswith("sleeping_sensor_"):
@@ -160,16 +240,19 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
             )
     hass.async_create_task(coordinator.async_start_discovery())
 
-    if coordinator.is_sensor:
-        # Do not block setup while the sensor is unavailable.  The coordinator
-        # keeps the configured local address available for wake-window probes;
-        # UDP discovery independently refreshes that address when a matching
-        # reply arrives.
+    if discovery is not None:
+        # The APK sends local Wi-Fi TCP only for an address present in its UDP
+        # cache. Configured entries therefore begin unavailable and refresh
+        # when their matching announcement is routed, including a cached
+        # announcement already received during setup.
         coordinator.async_set_updated_data({})
     else:
+        # Preserve a usable manual path if Home Assistant could not create the
+        # UDP listener at all.
         await coordinator.async_config_entry_first_refresh()
 
     hass.data[DOMAIN][entry.entry_id] = coordinator
+    _async_remove_obsolete_schedule_entities(hass, entry)
 
     # Set up platforms (light, switch, sensor, etc.)
     await hass.config_entries.async_forward_entry_setups(entry, PLATFORMS)
@@ -188,6 +271,7 @@ async def async_reload_entry(hass: HomeAssistant, entry: ConfigEntry) -> None:
 async def async_unload_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     """Unload a config entry."""
     if entry.data.get("entry_type") == DISCOVERY_CONTROLLER_ENTRY_TYPE:
+        _remove_debug_entry(hass, entry.entry_id)
         return True
 
     unload_ok = await hass.config_entries.async_unload_platforms(entry, PLATFORMS)
@@ -196,8 +280,8 @@ async def async_unload_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
         coordinator = hass.data[DOMAIN].pop(entry.entry_id)
         service = hass.data[DOMAIN].get(DATA_DISCOVERY_SERVICE)
         if service is not None and coordinator.device.device_id:
-            service.unregister_device(coordinator.device.device_id)
+            service.unregister_device(coordinator.device.device_id, entry.entry_id)
             service.unregister_address(entry.data.get("ip_address", ""))
         await coordinator.async_close()
-
+        _remove_debug_entry(hass, entry.entry_id)
     return unload_ok

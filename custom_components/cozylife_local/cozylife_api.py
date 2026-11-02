@@ -2,18 +2,18 @@ import asyncio
 import inspect
 import json
 import logging
+import socket
 import time
 from typing import Any, Callable, Dict, List, Optional
 
 from .discovery import get_model_info
+from .debug import summarize_frame
 
 _LOGGER = logging.getLogger(__name__)
 _RAW_LOGGER = logging.getLogger(f"{__name__}.raw")
-_RAW_LOGGER.setLevel(logging.INFO)
 
 COZYLIFE_PORT = 5555
 COZYLIFE_UDP_DISCOVERY_PORT = 6095
-SENSOR_SOCKET_RECYCLE_SECONDS = 30.0
 CMD_INFO = 0
 CMD_QUERY = 2
 CMD_SET = 3
@@ -42,11 +42,20 @@ class CozyLifeDevice:
         self._dpid: Optional[List[str]] = None
         self._device_type_code: Optional[str] = None
         self._pending_responses: Dict[str, asyncio.Future[Optional[Dict[str, Any]]]] = {}
+        self._state_waiters: list[asyncio.Future[Dict[str, Any]]] = []
         self._message_listener: Optional[Callable[[Dict[str, Any]], Any]] = None
         self._reader_task: Optional[asyncio.Task[None]] = None
         self._connection_lock: Optional[asyncio.Lock] = None
         self._status_lock: Optional[asyncio.Lock] = None
-        self._connected_at: Optional[float] = None
+        self._last_transport_error: Optional[str] = None
+        self._tcp_user_timeout_ms: int | None = None
+        self.last_frame_received_at: float | None = None
+
+    def set_tcp_user_timeout(self, milliseconds: int) -> None:
+        """Bound unacknowledged TCP data without timing sensor reports."""
+        if milliseconds <= 0:
+            raise ValueError("TCP user timeout must be positive")
+        self._tcp_user_timeout_ms = milliseconds
 
     @property
     def ip_address(self) -> str:
@@ -72,6 +81,16 @@ class CozyLifeDevice:
     def device_type_code(self) -> Optional[str]:
         return self._device_type_code
 
+    @property
+    def last_transport_error(self) -> Optional[str]:
+        """Return the latest local TCP failure for diagnostics."""
+        return self._last_transport_error
+
+    @property
+    def is_connected(self) -> bool:
+        """Return whether the persistent local TCP writer remains usable."""
+        return self._writer is not None and not self._writer.is_closing()
+
     def set_timeout(self, timeout: float) -> None:
         """Set the bounded duration for one local request attempt."""
         if timeout <= 0:
@@ -88,21 +107,38 @@ class CozyLifeDevice:
             return False
         await self.async_close()
         self._ip_address = ip_address
-        _LOGGER.info("CozyLife device %s moved to %s", self._device_id, ip_address)
+        _LOGGER.info("CozyLife device address refreshed")
         return True
 
     def restore_from_cache(self, device_id: str, pid: str, device_type_code: str, dpids: List[str]) -> None:
-        """Restore device info from cached config entry data without contacting the device."""
+        """Restore local identity and its verified capability inventory."""
         model_info = get_model_info(pid)
         self._device_id = device_id
         self._pid = pid
         self._device_type_code = device_type_code
-        self._dpid = dpids
+        self._dpid = self._catalog_backed_dpids(dpids, model_info)
         self._device_model_name = (
             model_info.model_name if model_info else f"CozyLife Device ({pid})"
         )
 
-    async def _connect(self) -> None:
+    @staticmethod
+    def _catalog_backed_dpids(
+        dpids: List[str],
+        model_info: Any,
+    ) -> List[str]:
+        """Return the complete verified capability inventory for a known PID.
+
+        A local attr:[0] inventory can be partial, and older config entries
+        persist that partial list.  The APK model catalogue is the supported
+        capability source for a known product; merge it with observed DPIDs so
+        platform setup and targeted reads use the same inventory.
+        """
+        capability_dpids = {str(dpid) for dpid in dpids}
+        if model_info is not None:
+            capability_dpids.update(str(dpid) for dpid in model_info.dpids)
+        return sorted(capability_dpids, key=int)
+
+    async def _connect(self, *, timeout: float | None = None) -> None:
         """Open one socket and retain it for the device's receive stream.
 
         Cozy Life's Android app has a dedicated TCP reader over its socket pool.
@@ -118,32 +154,43 @@ class CozyLifeDevice:
             if self._writer and not self._writer.is_closing():
                 return
             try:
+                _RAW_LOGGER.debug("Opening persistent CozyLife socket")
                 reader, writer = await asyncio.wait_for(
                     asyncio.open_connection(self._ip_address, COZYLIFE_PORT),
-                    timeout=self._timeout,
+                    timeout=self._timeout if timeout is None else timeout,
                 )
-            except (asyncio.TimeoutError, ConnectionRefusedError, OSError):
+            except (asyncio.TimeoutError, ConnectionRefusedError, OSError) as err:
+                self._last_transport_error = type(err).__name__
+                _RAW_LOGGER.debug("Could not open CozyLife socket: %s", type(err).__name__)
                 self._disconnect()
                 raise
 
             self._reader = reader
+            if self._tcp_user_timeout_ms is not None:
+                tcp_socket = writer.get_extra_info("socket")
+                option = getattr(socket, "TCP_USER_TIMEOUT", None)
+                if tcp_socket is not None and option is not None:
+                    try:
+                        tcp_socket.setsockopt(
+                            socket.IPPROTO_TCP, option, self._tcp_user_timeout_ms
+                        )
+                    except OSError:
+                        writer.close()
+                        self._reader = None
+                        raise
             self._writer = writer
             self._reader_task = asyncio.create_task(
                 self._read_frames(reader, writer),
                 name=f"cozylife-reader-{self._ip_address}",
             )
-            _RAW_LOGGER.debug(
-                "Connected persistent CozyLife socket at %s:%s",
-                self._ip_address,
-                COZYLIFE_PORT,
-            )
+            self._last_transport_error = None
+            _RAW_LOGGER.debug("Connected persistent CozyLife socket")
 
     def _disconnect(self) -> None:
         """Close the socket and release callers waiting for a response."""
         writer = self._writer
         self._reader = None
         self._writer = None
-        self._connected_at = None
         if writer:
             try:
                 writer.close()
@@ -154,6 +201,10 @@ class CozyLifeDevice:
             if not future.done():
                 future.set_result(None)
         self._pending_responses.clear()
+        for future in self._state_waiters:
+            if not future.done():
+                future.set_result({})
+        self._state_waiters.clear()
 
     async def async_close(self) -> None:
         """Release the persistent TCP reader when its config entry unloads."""
@@ -177,26 +228,46 @@ class CozyLifeDevice:
             while True:
                 raw_frame = await reader.readline()
                 if not raw_frame:
+                    _RAW_LOGGER.debug("Persistent CozyLife socket reached EOF")
                     return
                 try:
                     frame = json.loads(raw_frame.decode("utf8").strip())
                 except (json.JSONDecodeError, UnicodeDecodeError) as err:
-                    _LOGGER.warning("Invalid frame from %s: %s", self._ip_address, err)
+                    _LOGGER.warning("Invalid CozyLife frame: %s", type(err).__name__)
                     continue
 
-                _RAW_LOGGER.debug("Received from %s: %r", self._ip_address, raw_frame)
+                _RAW_LOGGER.debug("Received CozyLife frame: %s", summarize_frame(raw_frame))
+                self.last_frame_received_at = time.time()
+                message = frame.get("msg")
                 sent_sn = frame.get("sn")
                 future = self._pending_responses.pop(sent_sn, None)
                 if future and not future.done():
-                    future.set_result(frame.get("msg") if frame.get("res") == 0 else None)
+                    future.set_result(
+                        frame.get("msg") if frame.get("res", 0) == 0 else None
+                    )
+
+                state_data = message.get("data") if isinstance(message, dict) else None
+                if isinstance(state_data, dict):
+                    normalized_state = {
+                        str(key): value for key, value in state_data.items()
+                    }
+                    for state_waiter in self._state_waiters:
+                        if not state_waiter.done():
+                            state_waiter.set_result(normalized_state)
+                    self._state_waiters.clear()
 
                 listener = self._message_listener
                 if listener is not None:
-                    result = listener(frame)
-                    if inspect.isawaitable(result):
-                        await result
+                    try:
+                        result = listener(frame)
+                        if inspect.isawaitable(result):
+                            await result
+                    except Exception:  # noqa: BLE001 - listener is integration code.
+                        _LOGGER.exception(
+                            "Error dispatching CozyLife frame",
+                        )
         except (ConnectionError, OSError) as err:
-            _LOGGER.debug("Persistent connection to %s ended: %s", self._ip_address, err)
+            _LOGGER.debug("Persistent CozyLife connection ended: %s", type(err).__name__)
         finally:
             if self._reader is reader and self._writer is writer:
                 self._disconnect()
@@ -212,14 +283,17 @@ class CozyLifeDevice:
                 return None
             response = asyncio.get_running_loop().create_future()
             self._pending_responses[sent_sn] = response
-            encoded_message = (json.dumps(message, separators=(",", ":")) + "\r\n").encode("utf8")
-            _RAW_LOGGER.debug("Sending to %s: %r", self._ip_address, encoded_message)
+            # The APK's local TCP writer sends the JSON bytes directly.  CRLF
+            # delimits device-to-client frames only; adding it to client writes
+            # changes the on-wire command from the app's native form.
+            encoded_message = json.dumps(message, separators=(",", ":")).encode("utf8")
+            _RAW_LOGGER.debug("Sending CozyLife frame: %s", summarize_frame(encoded_message))
             writer.write(encoded_message)
             await writer.drain()
             try:
                 return await asyncio.wait_for(asyncio.shield(response), timeout=self._timeout)
             except asyncio.TimeoutError:
-                _LOGGER.warning("Timeout waiting for response with sn %s from %s", sent_sn, self._ip_address)
+                _LOGGER.warning("Timeout waiting for a CozyLife response")
                 # A persistent socket whose peer stopped answering is not a
                 # usable transport for the next request.  Discard it so the
                 # next attempt performs a clean local reconnect.
@@ -227,9 +301,33 @@ class CozyLifeDevice:
                 return None
             finally:
                 self._pending_responses.pop(sent_sn, None)
-        except (asyncio.TimeoutError, ConnectionRefusedError, OSError):
+        except (asyncio.TimeoutError, ConnectionRefusedError, OSError) as err:
+            _RAW_LOGGER.debug("CozyLife request transport failure: %s", type(err).__name__)
             self._disconnect()
             return None
+
+    async def _async_send(self, cmd: int, payload: Dict[str, Any]) -> bool:
+        """Write one APK-shaped local command without requiring an ACK frame.
+
+        CozyLife's local writer marks a command sent after the socket write and
+        leaves every later state frame to its address-routed reader.  In
+        particular, a CMD_SET does not need a correlated response to be a
+        successful device command.
+        """
+        try:
+            await self._connect()
+            writer = self._writer
+            if writer is None:
+                return False
+            message = self._create_message(cmd, payload)
+            encoded_message = json.dumps(message, separators=(",", ":")).encode("utf8")
+            _RAW_LOGGER.debug("Sending CozyLife frame: %s", summarize_frame(encoded_message))
+            writer.write(encoded_message)
+            await asyncio.wait_for(writer.drain(), timeout=self._timeout)
+            return True
+        except (asyncio.TimeoutError, ConnectionRefusedError, OSError):
+            self._disconnect()
+            return False
 
     def _create_message(self, cmd: int, payload: Dict[str, Any]) -> Dict[str, Any]:
         """Helper to create the JSON message structure."""
@@ -259,7 +357,7 @@ class CozyLifeDevice:
         # Step 1: Get basic device info (did, pid, dtp)
         info_msg = await self._send_receive(CMD_INFO, {})
         if not info_msg or not all(k in info_msg for k in ['did', 'pid', 'dtp']):
-            _LOGGER.warning(f"Device info query failed or missing critical fields: {info_msg}")
+            _LOGGER.warning("Device info query failed or omitted required fields")
             return False
 
         self._device_id = info_msg['did']
@@ -278,141 +376,141 @@ class CozyLifeDevice:
             if query_msg and ('attr' in query_msg or 'data' in query_msg):
                 break
             _LOGGER.debug(
-                "DPID query attempt %s/%s failed for %s: %s",
+                "DPID query attempt %s/%s failed",
                 attempt,
                 DPID_QUERY_ATTEMPTS,
-                self._ip_address,
-                query_msg,
             )
 
         if not query_msg:
-            _LOGGER.warning(f"Failed to query DPID list from device: {query_msg}")
+            _LOGGER.warning("Failed to query DPID list from CozyLife device")
             # We can still proceed with a minimal setup if this fails
-            self._dpid = []
+            self._dpid = self._catalog_backed_dpids([], model_info)
             return True # Return true as we have the basic info
 
         if 'attr' in query_msg:
-            self._dpid = [str(dpid) for dpid in query_msg['attr']]
+            observed_dpids = [str(dpid) for dpid in query_msg['attr']]
         elif 'data' in query_msg:
-            self._dpid = [str(dpid) for dpid in query_msg['data']]
+            observed_dpids = [str(dpid) for dpid in query_msg['data']]
         else:
-            self._dpid = []
+            observed_dpids = []
+        self._dpid = self._catalog_backed_dpids(observed_dpids, model_info)
 
         _LOGGER.info(
-            f"Successfully discovered device {self._ip_address} locally: "
-            f"DID={self.device_id}, PID={self.pid}, Type={self.device_type_code}, DPIDs={self.dpid}"
+            "Successfully discovered CozyLife device locally: PID=%s, Type=%s, DPIDs=%s",
+            self.pid,
+            self.device_type_code,
+            self.dpid,
         )
         return True
 
-    async def async_get_state(self, dpids: Optional[List[str]] = None) -> Optional[Dict[str, Any]]:
-        """Queries the current state of the device."""
-        payload = {}
-        if dpids:
-            payload["attr"] = [int(dpid) for dpid in dpids]
-
-        msg = await self._send_receive(CMD_QUERY, payload)
-        if msg and 'data' in msg:
-            return {str(k): v for k, v in msg['data'].items()}
-        return None
-
     async def async_get_status(self) -> Optional[Dict[str, Any]]:
-        """Use the APK's local refresh request: cmd 2 with ``attr:[1]``."""
-        msg = await self._send_receive(CMD_QUERY, {"attr": [1]})
-        if msg and "data" in msg:
-            return {str(key): value for key, value in msg["data"].items()}
-        return None
+        """Request APK status and await the next state frame, not a matching SN."""
+        return await self._async_get_state([1])
 
-    async def async_send_status(self) -> bool:
-        """Write the APK status request without waiting for an accepted reply.
+    async def async_get_state(self, dpids: list[str]) -> Optional[Dict[str, Any]]:
+        """Read a documented subset of locally advertised DPIDs."""
+        return await self._async_get_state([int(dpid) for dpid in dpids])
 
-        Cozy Life's ``WifiTcpMessage.expectAccept`` is false.  Its reader,
-        rather than the writer, receives the asynchronous sensor report.
+    async def async_request_properties(self, *, timeout: float | None = None) -> bool:
+        """Request powered properties through the APK's listener-based path.
+
+        The CozyLife Wi-Fi client sends ``attr:[0]`` and routes the next local
+        state frame through the device listener. The local write is the request
+        completion; a later frame updates the coordinator independently.
         """
         if self._status_lock is None:
             self._status_lock = asyncio.Lock()
 
-        # The discovery callback and the wake-window loop can both request a
-        # status frame.  Keep their connect/write operations strictly serial:
-        # one durable socket is preferable to briefly opening two competing
-        # sockets while the device is awake.
         async with self._status_lock:
-            return await self._async_send_status()
-
-    async def _async_send_status(self) -> bool:
-        """Send one status frame while the status transport lock is held."""
-        # The APK's UDP daemon cadence and this TCP lifecycle are separate.
-        # Recycle a retained sensor socket after the integration's 30-second
-        # local transport window so a later wake probe does not write to a
-        # stale peer connection.
-        if (
-            self._writer
-            and not self._writer.is_closing()
-            and self._connected_at is not None
-            and time.monotonic() - self._connected_at >= SENSOR_SOCKET_RECYCLE_SECONDS
-        ):
-            if self._connection_lock is None:
-                self._connection_lock = asyncio.Lock()
-            async with self._connection_lock:
-                if (
-                    self._writer
-                    and not self._writer.is_closing()
-                    and self._connected_at is not None
-                    and time.monotonic() - self._connected_at
-                    >= SENSOR_SOCKET_RECYCLE_SECONDS
-                ):
-                    self._disconnect()
-
-        # A waking battery sensor can accept a connection only briefly. Do
-        # not serialize a new TCP connect behind an earlier one that is still
-        # waiting for its full APK-derived deadline; install whichever probe
-        # reaches the device first, then retain that socket for the reader.
-        if not self._writer or self._writer.is_closing():
-            try:
-                reader, writer = await asyncio.wait_for(
-                    asyncio.open_connection(self._ip_address, COZYLIFE_PORT),
-                    timeout=self._timeout,
+            return (
+                await self._async_request_state(
+                    [0], wait_for_state=False, transport_timeout=timeout
                 )
-            except (asyncio.TimeoutError, ConnectionRefusedError, OSError):
-                return False
+                is not None
+            )
 
-            if self._connection_lock is None:
-                self._connection_lock = asyncio.Lock()
-            async with self._connection_lock:
-                if self._writer and not self._writer.is_closing():
-                    writer.close()
-                    try:
-                        await writer.wait_closed()
-                    except OSError:
-                        pass
-                else:
-                    self._reader = reader
-                    self._writer = writer
-                    self._connected_at = time.monotonic()
-                    self._reader_task = asyncio.create_task(
-                        self._read_frames(reader, writer),
-                        name=f"cozylife-reader-{self._ip_address}",
-                    )
+    async def _async_get_state(self, attributes: list[int]) -> Optional[Dict[str, Any]]:
+        """Request the selected APK state payload and await its state frame."""
+        if self._status_lock is None:
+            self._status_lock = asyncio.Lock()
+
+        async with self._status_lock:
+            return await self._async_request_state(
+                attributes, wait_for_state=True
+            )
+
+    async def async_send_status(self) -> bool:
+        """Queue one app-shaped status request on the retained local socket.
+
+        The APK's local writer treats a completed socket write as sent and
+        leaves later frames to its independent reader. Non-state frames are
+        not a reason to disconnect a socket that may still deliver the
+        sensor's report while it is awake.
+        """
+        if self._status_lock is None:
+            self._status_lock = asyncio.Lock()
+
+        async with self._status_lock:
+            return (
+                await self._async_request_state([1], wait_for_state=False)
+            ) is not None
+
+    async def _async_request_state(
+        self,
+        attributes: list[int],
+        *,
+        wait_for_state: bool,
+        transport_timeout: float | None = None,
+    ) -> Optional[Dict[str, Any]]:
+        """Use the APK write-and-listen state path over one durable socket."""
         try:
+            timeout = self._timeout if transport_timeout is None else transport_timeout
+            await self._connect(timeout=timeout)
             writer = self._writer
             if writer is None:
-                return False
-            message = self._create_message(CMD_QUERY, {"attr": [1]})
-            writer.write(
-                (json.dumps(message, separators=(",", ":")) + "\r\n").encode("utf8")
-            )
-            await writer.drain()
-            return True
+                return None
+
+            state_waiter: asyncio.Future[Dict[str, Any]] | None = None
+            if wait_for_state:
+                state_waiter = asyncio.get_running_loop().create_future()
+                self._state_waiters.append(state_waiter)
+
+            message = self._create_message(CMD_QUERY, {"attr": attributes})
+            encoded_message = json.dumps(message, separators=(",", ":")).encode("utf8")
+            _RAW_LOGGER.debug("Sending CozyLife frame: %s", summarize_frame(encoded_message))
+            writer.write(encoded_message)
+            await asyncio.wait_for(writer.drain(), timeout=timeout)
+
+            if state_waiter is None:
+                return {}
+
+            try:
+                state_data = await asyncio.wait_for(
+                    asyncio.shield(state_waiter), timeout=timeout
+                )
+                return state_data or None
+            except asyncio.TimeoutError:
+                # A short no-reply window is the normal sleeping-sensor case,
+                # not an integration error. Keep it available for diagnostics
+                # without flooding the Home Assistant log at warning level.
+                _LOGGER.debug(
+                    "Timeout waiting for an APK-style CozyLife state frame",
+                )
+                return None
+            finally:
+                if state_waiter in self._state_waiters:
+                    self._state_waiters.remove(state_waiter)
         except (asyncio.TimeoutError, ConnectionRefusedError, OSError):
             self._disconnect()
-            return False
+            return None
 
     async def async_set_state(self, attributes: Dict[str, Any]) -> bool:
-        """Sets attributes on the device."""
-        msg = await self._send_receive(CMD_SET, attributes)
-        # For CMD_SET, the response msg contains the set attributes if successful.
-        # We can compare it with the sent attributes for confirmation.
-        if msg and 'data' in msg:
-            # A more robust check would compare the sent attributes with the received
-            # for exact match, but for now, just checking 'data' is present
-            return True
-        return False
+        """Write a user command without waiting behind availability work.
+
+        ``StreamWriter.write`` appends one complete framed command before its
+        first await, so a CMD_SET cannot interleave bytes with the periodic
+        ``attr:[0]`` request.  It must not share the refresh lock: a stalled
+        availability connection otherwise delays an interactive ON/OFF action
+        for the complete local TCP timeout.
+        """
+        return await self._async_send(CMD_SET, attributes)
