@@ -509,6 +509,19 @@ class CozyLifeCoordinator(DataUpdateCoordinator[dict[str, Any]]):
                 raise UpdateFailed("Failed to query state from CozyLife device")
             return state_data
 
+        # dsh-light-state 2026-11-02: the LED strip answers ``attr:[0]`` only
+        # when the request waits for the state frame. With the listener path
+        # below it accepts the write and never reports, so the light entity kept
+        # a stale state: the strip was lit purple while Home Assistant said off
+        # (and the card showed no brightness or colour). Measured 2026-10-21 and
+        # again after the 1.1.6 merge.
+        classification = getattr(self, "classification", None)
+        if classification is not None and getattr(classification, "is_light", False):
+            state_data = await self.device.async_get_state(["0"])
+            if state_data is None:
+                raise UpdateFailed("Failed to query state from CozyLife light")
+            return state_data
+
         # The APK queues ``attr:[0]`` as a local write and routes a later
         # state frame to the device listener; it does not make this command
         # contingent on a correlated or immediate state reply. Its short-lived
